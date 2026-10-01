@@ -152,7 +152,7 @@ class ModeFilter:
     def update(self, gesture, hand_present):
         if not hand_present:
             self.absent += 1
-            if self.absent > self.absent_reset:
+            if self.absent >= self.absent_reset:
                 self.mode, self.pending, self.count = None, None, 0
             return self.mode
         self.absent = 0
@@ -311,7 +311,9 @@ def draw_header(frame, active_tool, bounds, header_height):
             cv2.rectangle(frame, (x1, 0), (x2 - 1, header_height - 1), (255, 255, 255), 4)
 
 def draw_skeleton(frame, pts):
-    xy = [(int(p[0]), int(p[1])) for p in pts]
+    h, w = frame.shape[:2]
+    xy = [(int(np.clip(p[0], 0, w - 1)), int(np.clip(p[1], 0, h - 1)))
+          for p in pts]
     for a, b in HAND_CONNECTIONS:
         cv2.line(frame, xy[a], xy[b], (200, 200, 200), 1, cv2.LINE_AA)
     for point in xy:
@@ -327,6 +329,8 @@ def ensure_model():
     part = MODEL_PATH.with_suffix(".part")
     try:
         urllib.request.urlretrieve(MODEL_URL, part)
+        if part.stat().st_size <= 1_000_000:
+            raise ValueError("Downloaded model is unexpectedly small")
         part.replace(MODEL_PATH)
     except Exception as error:
         print(f"Could not download the model: {error}\n"
@@ -390,6 +394,7 @@ class Painter:
         self.toast, self.toast_until = "", 0.0
         self.history = []
         self.post_snap_lock = False  # FIX 1: Post-snap lock initialization
+        self._paint_mask = None
         
         # shape snapping state
         self.snap = SHAPE_SNAP_DEFAULT
@@ -412,6 +417,9 @@ class Painter:
             ch, cw = min(h, self.canvas.shape[0]), min(w, self.canvas.shape[1])
             new[:ch, :cw] = self.canvas[:ch, :cw]
             self.canvas, self.prev = new, None
+            self.history.clear()
+            self._end_stroke()
+            self.post_snap_lock = False
         if self.bounds is None or self.bounds[-1][3] != w:
             self.bounds = build_palette_bounds(w)
 
@@ -545,7 +553,12 @@ class Painter:
             tip = (int(min(max(pts[8][0], 0), w - 1)), int(min(max(pts[8][1], 0), h - 1)))
         self.gesture = gesture
         mode = self.filter.update(gesture, pts is not None)
-        action = mode if (gesture is not None and gesture == mode) else None
+        if pts is None:
+            action = None
+        elif gesture is None:
+            action = mode
+        else:
+            action = mode if gesture == mode else None
 
         hovered = None
         if action == "select":
@@ -556,20 +569,19 @@ class Painter:
         elif action == "draw":
             self.gap = 0
             if tip[1] < header_h:
+                self.post_snap_lock = False
                 self._end_stroke()
+            elif self.post_snap_lock:
+                self.last_raw_tip = tip
             else:
                 if self.prev is None:
-                    # FIX 1: Check lock before starting a new stroke
-                    if self.post_snap_lock:
-                        self.last_raw_tip = tip
-                    else:
-                        self._push_history()
-                        self.stroke_snapshot = self.history[-1]
-                        self.stroke = [tip]
-                        self.hold_start = None
-                        self.snapped = False
-                        self.last_raw_tip = tip
-                        self.shape_preview = None
+                    self._push_history()
+                    self.stroke_snapshot = self.history[-1]
+                    self.stroke = [tip]
+                    self.hold_start = None
+                    self.snapped = False
+                    self.last_raw_tip = tip
+                    self.shape_preview = None
                 else:
                     self.stroke.append(tip)
                 self._paint(tip)
@@ -592,8 +604,10 @@ class Painter:
         else:
             self.clear_start, self.clear_done = None, False
 
-        painted = self.canvas.any(axis=2)
-        frame[painted] = self.canvas[painted]
+        if self._paint_mask is None or self._paint_mask.shape != (h, w):
+            self._paint_mask = np.empty((h, w), dtype=bool)
+        np.any(self.canvas, axis=2, out=self._paint_mask)
+        np.copyto(frame, self.canvas, where=self._paint_mask[..., None])
         if pts is not None:
             draw_skeleton(frame, pts)
         draw_header(frame, self.tool, self.bounds, header_h)
@@ -666,17 +680,18 @@ def open_camera():
     return cap
 
 def main():
-    ensure_model()
-    cap = open_camera()
-    if not cap.isOpened():
-        print("Error: could not access the webcam (is another app using it? try CAMERA_INDEX = 1).")
-        cap.release()
-        return
-    tracker = HandTracker()
-    painter = Painter()
-    failed_reads = frames = 0
-    check_window = None
+    cap = None
+    tracker = None
     try:
+        ensure_model()
+        cap = open_camera()
+        if not cap.isOpened():
+            print("Error: could not access the webcam (is another app using it? try CAMERA_INDEX = 1).")
+            return
+        tracker = HandTracker()
+        painter = Painter()
+        failed_reads = frames = 0
+        check_window = None
         while True:
             ok, frame = cap.read()
             if not ok:
@@ -699,17 +714,27 @@ def main():
                 try:
                     visible = cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE)
                 except cv2.error:
-                    visible = 0
+                    check_window = False
+                    visible = 1
                 if check_window is None:
-                    check_window = visible >= 1
+                    if visible >= 1:
+                        check_window = True
+                    else:
+                        break
                 elif check_window and visible < 1:
                     break
     except KeyboardInterrupt:
         print("Interrupted - closing.")
     finally:
-        cap.release()
-        tracker.close()
-        cv2.destroyAllWindows()
+        try:
+            if cap is not None:
+                cap.release()
+        finally:
+            try:
+                if tracker is not None:
+                    tracker.close()
+            finally:
+                cv2.destroyAllWindows()
 
 # FIX: Corrected __name__ dunder
 if __name__ == "__main__":
